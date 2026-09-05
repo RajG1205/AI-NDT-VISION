@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import os
+
+import numpy as np
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
 
 MODEL_PATH = Path(os.getenv("NDT_MODEL_PATH", "models/best.pt"))
+DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
 
 
 def severity_for(class_name: str, confidence: float, box_area_ratio: float) -> tuple[str, float]:
@@ -23,6 +26,9 @@ class Detector:
         self._model = None
         self.version = os.getenv("NDT_MODEL_VERSION", "unconfigured")
         self.model_hash: str | None = None
+        if DEMO_MODE:
+            self.version = os.getenv("NDT_MODEL_VERSION", "demo-ndt-1.0")
+            return
         if MODEL_PATH.exists():
             try:
                 from ultralytics import YOLO
@@ -34,19 +40,33 @@ class Detector:
 
     @property
     def loaded(self) -> bool:
-        return self._model is not None
+        return self._model is not None or DEMO_MODE
 
     @property
     def classes(self) -> list[str]:
+        if DEMO_MODE and self._model is None:
+            return ["Potential Indication (Demo)"]
         if not self.loaded:
             return []
         names = self._model.names
         return [str(names[i]) for i in sorted(names)]
 
     def info(self) -> dict[str, Any]:
-        return {"name": "YOLO NDT Defect Detector", "version": self.version, "hash": self.model_hash, "status": "available" if self.loaded else "not_connected", "classes": self.classes, "dataset": None, "metrics": None, "limitations": ["Model performance depends on its training data and deployment conditions.", "Severity is a prototype triage heuristic and not an acceptance criterion.", "Predictions require qualified NDT review."], "device": getattr(self._model, "device", None).__str__() if self.loaded else None}
+        return {"name": "YOLO NDT Defect Detector", "version": self.version, "hash": self.model_hash, "status": "demo" if DEMO_MODE and self._model is None else ("available" if self.loaded else "not_connected"), "mode": "demo" if DEMO_MODE and self._model is None else "model", "classes": self.classes, "dataset": None, "metrics": None, "limitations": ["Demo mode provides deterministic simulated indications and is not a trained defect detector.", "Model performance depends on its training data and deployment conditions.", "Severity is a prototype triage heuristic and not an acceptance criterion.", "Predictions require qualified NDT review."], "device": getattr(self._model, "device", None).__str__() if self.loaded else None}
 
     def predict(self, image: Image.Image, confidence: float) -> list[dict[str, Any]]:
+        if DEMO_MODE and self._model is None:
+            gray = np.asarray(image.convert("L"), dtype=np.float32)
+            contrast = float(gray.std() / 64.0)
+            score = max(0.35, min(0.92, 0.55 + contrast * 0.18))
+            if score < confidence:
+                return []
+            w, h = image.size
+            box_w, box_h = w * 0.24, h * 0.16
+            x1, y1 = (w - box_w) / 2, (h - box_h) / 2
+            severity, severity_score = severity_for("Potential Indication (Demo)", score, (box_w * box_h) / (w * h))
+            return [{"class": "Potential Indication (Demo)", "confidence": round(score, 6), "bbox": {"x1": round(x1, 2), "y1": round(y1, 2), "x2": round(x1 + box_w, 2), "y2": round(y1 + box_h, 2)}, "severity": severity, "severity_score": severity_score}]
+
         results = self._model.predict(source=image, conf=confidence, verbose=False)
         result = results[0]
         names = result.names
