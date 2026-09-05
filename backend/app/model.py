@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import urllib.request
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ ALLOW_SIMULATION = os.getenv("ALLOW_SIMULATION", "false").lower() == "true"
 
 # This public model is a weld-visual inspection model, not a PAUT waveform model.
 MODEL_MODALITY = os.getenv("NDT_MODEL_MODALITY", "weld_visual")
+logger = logging.getLogger("ai_ndt_vision.model")
 
 
 def severity_for(class_name: str, confidence: float, box_area_ratio: float) -> tuple[str, float]:
@@ -50,8 +52,16 @@ def ensure_model() -> None:
 
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     try:
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        logger.info("Downloading NDT model from %s", MODEL_URL)
+        with urllib.request.urlopen(MODEL_URL, timeout=120) as response, MODEL_PATH.open("wb") as output:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+        logger.info("NDT model downloaded: %s bytes", MODEL_PATH.stat().st_size)
     except Exception as exc:
+        logger.exception("NDT model download failed")
         try:
             MODEL_PATH.unlink(missing_ok=True)
         except Exception:
@@ -93,6 +103,7 @@ class Detector:
             except Exception:
                 self._model = None
                 self.mode = "model_error"
+                logger.exception("NDT model failed to load from %s", MODEL_PATH)
 
     @property
     def loaded(self) -> bool:
