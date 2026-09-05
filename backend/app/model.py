@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import hashlib
 import os
+import urllib.request
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
 
 MODEL_PATH = Path(os.getenv("NDT_MODEL_PATH", "models/best.pt"))
+MODEL_URL = os.getenv(
+    "NDT_MODEL_URL",
+    "https://raw.githubusercontent.com/zanexkun/weld-defect-detection-yolov8/main/best.pt",
+)
 DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
 ALLOW_SIMULATION = os.getenv("ALLOW_SIMULATION", "false").lower() == "true"
+
+# This public model is a weld-visual inspection model, not a PAUT waveform model.
+MODEL_MODALITY = os.getenv("NDT_MODEL_MODALITY", "weld_visual")
 
 
 def severity_for(class_name: str, confidence: float, box_area_ratio: float) -> tuple[str, float]:
@@ -19,7 +27,7 @@ def severity_for(class_name: str, confidence: float, box_area_ratio: float) -> t
         0.85
         if any(k in name for k in ("crack", "fracture"))
         else 0.65
-        if any(k in name for k in ("corrosion", "weld"))
+        if any(k in name for k in ("corrosion", "weld", "defect"))
         else 0.45
     )
     score = max(
@@ -35,18 +43,40 @@ def severity_for(class_name: str, confidence: float, box_area_ratio: float) -> t
     return severity, round(score, 4)
 
 
+def ensure_model() -> None:
+    """Download the configured public weights once when the container starts."""
+    if MODEL_PATH.exists() or not MODEL_URL:
+        return
+
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    except Exception as exc:
+        try:
+            MODEL_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise RuntimeError(f"Unable to download NDT model from NDT_MODEL_URL: {exc}") from exc
+
+
 class Detector:
     def __init__(self) -> None:
         self._model = None
         self.version = os.getenv("NDT_MODEL_VERSION", "unconfigured")
         self.model_hash: str | None = None
         self.mode = "unconfigured"
+        self.source = MODEL_URL or None
 
-        # Simulation is intentionally opt-in. Production must never manufacture
-        # a defect, confidence value, or bounding box when no trained model exists.
         if DEMO_MODE and ALLOW_SIMULATION:
             self.version = os.getenv("NDT_MODEL_VERSION", "simulation-ndt-1.0")
             self.mode = "simulation"
+            self.source = "local simulation"
+            return
+
+        try:
+            ensure_model()
+        except Exception:
+            self.mode = "model_error"
             return
 
         if MODEL_PATH.exists():
@@ -54,7 +84,10 @@ class Detector:
                 from ultralytics import YOLO
 
                 self._model = YOLO(str(MODEL_PATH))
-                self.version = os.getenv("NDT_MODEL_VERSION", MODEL_PATH.stem)
+                self.version = os.getenv(
+                    "NDT_MODEL_VERSION",
+                    "weld-yolov8s-public-3class",
+                )
                 self.model_hash = hashlib.sha256(MODEL_PATH.read_bytes()).hexdigest()[:16]
                 self.mode = "model"
             except Exception:
@@ -80,12 +113,18 @@ class Detector:
             "Severity is a prototype triage heuristic and not an acceptance criterion.",
         ]
 
-        if self.mode == "simulation":
+        if self.mode == "model":
+            limitations.insert(
+                0,
+                "The configured public model is trained for weld-visual images "
+                "(Bad Weld, Good Weld, Defect); it is not a PAUT waveform interpreter.",
+            )
+        elif self.mode == "simulation":
             limitations.insert(
                 0,
                 "Simulation mode is for UI/workflow testing only and is not a trained defect detector.",
             )
-        elif self.mode != "model":
+        else:
             limitations.insert(
                 0,
                 "No trained NDT model is configured. Inference is intentionally disabled.",
@@ -103,6 +142,8 @@ class Detector:
                 else "not_connected"
             ),
             "mode": self.mode,
+            "modality": MODEL_MODALITY,
+            "source": self.source,
             "classes": self.classes,
             "dataset": None,
             "metrics": None,
@@ -112,8 +153,6 @@ class Detector:
 
     def predict(self, image: Image.Image, confidence: float) -> list[dict[str, Any]]:
         if self.mode == "simulation":
-            # Keep simulation deterministic and unmistakably labelled. It exists
-            # only to exercise the frontend/report/storage workflow.
             w, h = image.size
             box_w, box_h = w * 0.20, h * 0.12
             x1, y1 = (w - box_w) / 2, (h - box_h) / 2
@@ -127,23 +166,24 @@ class Detector:
                 simulated_confidence,
                 (box_w * box_h) / (w * h),
             )
-            return [
-                {
-                    "class": "Simulated Indication",
-                    "confidence": simulated_confidence,
-                    "bbox": {
-                        "x1": round(x1, 2),
-                        "y1": round(y1, 2),
-                        "x2": round(x1 + box_w, 2),
-                        "y2": round(y1 + box_h, 2),
-                    },
-                    "severity": severity,
-                    "severity_score": severity_score,
-                }
-            ]
+            return [{
+                "class": "Simulated Indication",
+                "confidence": simulated_confidence,
+                "bbox": {
+                    "x1": round(x1, 2),
+                    "y1": round(y1, 2),
+                    "x2": round(x1 + box_w, 2),
+                    "y2": round(y1 + box_h, 2),
+                },
+                "severity": severity,
+                "severity_score": severity_score,
+            }]
 
         if self._model is None:
-            raise RuntimeError("No trained NDT model is configured.")
+            raise RuntimeError(
+                "No trained YOLO model is configured. "
+                "Set NDT_MODEL_PATH or NDT_MODEL_URL to valid trained weights."
+            )
 
         results = self._model.predict(source=image, conf=confidence, verbose=False)
         result = results[0]
@@ -161,20 +201,18 @@ class Detector:
                 conf,
                 area / image_area if image_area else 0,
             )
-            output.append(
-                {
-                    "class": str(names[cls]),
-                    "confidence": round(conf, 6),
-                    "bbox": {
-                        "x1": round(coords[0], 2),
-                        "y1": round(coords[1], 2),
-                        "x2": round(coords[2], 2),
-                        "y2": round(coords[3], 2),
-                    },
-                    "severity": severity,
-                    "severity_score": score,
-                }
-            )
+            output.append({
+                "class": str(names[cls]),
+                "confidence": round(conf, 6),
+                "bbox": {
+                    "x1": round(coords[0], 2),
+                    "y1": round(coords[1], 2),
+                    "x2": round(coords[2], 2),
+                    "y2": round(coords[3], 2),
+                },
+                "severity": severity,
+                "severity_score": score,
+            })
 
         return output
 
