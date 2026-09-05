@@ -98,18 +98,19 @@ def root():
     return {
         "name": "AI-NDT Vision Inference API",
         "status": "ok",
-        "docs": "/docs",
+        "docs": "/docs" if app.docs_url else None,
         "health": "/api/v1/health",
+        "analysis_mode": detector.mode,
     }
 
 
 @app.get("/api/v1/health")
 def health():
-    return {"status": "ok", "model_loaded": detector.loaded}
+    return {"status": "ok", "model_loaded": detector.loaded, "analysis_mode": detector.mode}
 
 @app.get("/api/v1/version")
 def version():
-    return {"model_version": detector.version, "api_version": app.version}
+    return {"model_version": detector.version, "api_version": app.version, "analysis_mode": detector.mode}
 
 @app.get("/api/v1/model")
 def model_info():
