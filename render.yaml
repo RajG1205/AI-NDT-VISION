@@ -9,7 +9,7 @@ services:
     autoDeploy: true
 
   - type: web
-    name: ai-ndt-vision-api
+    name: ai-ndt-vision-api-prod
     runtime: python
     plan: free
     region: singapore
